@@ -1,4 +1,5 @@
 from sanic import Sanic
+from sanic.exceptions import ServerError
 from sanic.response import json as sjson
 # from sanic.log import logger
 import configparser
@@ -11,6 +12,7 @@ from multiprocessing import Process #
 from pathos.multiprocessing import ProcessingPool as Pool#多进程
 from multiprocessing import Pool as POOL #多进程
 from multiprocessing.dummy import Pool as ThreadPool #多线程
+import signal
 # import aiohttp
 import json
 import requests
@@ -133,12 +135,12 @@ class Service(object):
     #使用策略处理单条输入数据
     def handle_input_item(self,strategy=None):
         def wrapper(func):
-            #将func变为可pickle的对象,多进程执行特有
-            self._process_deal_func=copyreg.constructor(func)
-            print(type(self._process_deal_func))
+            # #将func变为可pickle的对象,多进程执行特有
+            # self._process_deal_func=copyreg.constructor(func)
+            # print(type(self._process_deal_func))
             #协程和线程则不需要
             self._handle_input_item = func
-            print(type(self._handle_input_item))
+            # print(type(self._handle_input_item))
             self.strategy=strategy
         return wrapper
     
@@ -158,7 +160,7 @@ class Service(object):
     def _retry_on_false(result):
         return result is False
 
-    @retry(stop_max_attempt_number=3, retry_on_result=_retry_on_false, wait_fixed=2000)
+    @retry(stop_max_attempt_number=3, retry_on_result=_retry_on_false, wait_exponential_multiplier=1000)
     def send_message(self, mes, topic):
         try:
             mesg = str(json.dumps(mes)).encode('utf-8')
@@ -180,45 +182,49 @@ class Service(object):
         #执行策略有："eventlet | thread | process"
         #执行策略 先判别单个数据的处理是否存在，若存在则使用策略对单条数据处理
         #若单条数据处理不存在则使用数据集处理函数
-        start_time=time.time()
-        if self._handle_input_item == None:
-            result_list=self._handle_input_items(data_list,config)
-        elif self.strategy == "eventlet":
-            #使用协程池 处理输入数据
-            
-            result_list=[]
-            pool = eventlet.GreenPool()
-            for res in pool.imap(self._handle_input_item, data_list, config_list):
-                result_list.append(res)
-    
-        elif self.strategy == "thread":
-            #将配置参数统一设置
-            part_func=partial(self._handle_input_item,config=config)
-            #使用多线程来处理输入数据
-            pool = ThreadPool()
-            result_list = pool.map(part_func, data_list)
-            pool.close()
-            pool.join()
+        try:
+            start_time=time.time()
+            if self._handle_input_item == None:
+                result_list=self._handle_input_items(data_list,config)
+            elif self.strategy == "eventlet":
+                #使用协程池 处理输入数据
+                
+                result_list=[]
+                pool = eventlet.GreenPool()
+                for res in pool.imap(self._handle_input_item, data_list, config_list):
+                    result_list.append(res)
+        
+            elif self.strategy == "thread":
+                #将配置参数统一设置
+                part_func=partial(self._handle_input_item,config=config)
+                #使用多线程来处理输入数据
+                pool = ThreadPool()
+                result_list = pool.map(part_func, data_list)
+                pool.close()
+                pool.join()
 
-        elif self.strategy == "process":
-            #使用多进程来处理数据
-            #self._process_deal_func是经过处理的函数
-            #part_func=partial(self._handle_input_item,config=config)
-            pool=Pool()
-            result_list=pool.map(self._handle_input_item,data_list,config_list)
-            # pool.close()
-            # pool.join()
+            elif self.strategy == "process":
+                #使用多进程来处理数据
+                #self._process_deal_func是经过处理的函数
+                #part_func=partial(self._handle_input_item,config=config)
+                pool=Pool()
+                result_list=pool.map(self._handle_input_item,data_list,config_list)
+                # pool.close()
+                # pool.join()
 
-        else:
-            self.logger.info("No strategy")
-            result_list=[]
-            for item in data_list:
-                result_list.append(self._handle_input_item(item,config))
+            else:
+                self.logger.info("No strategy")
+                result_list=[]
+                for item in data_list:
+                    result_list.append(self._handle_input_item(item,config))
 
-        end_time=time.time()
-        self.logger.info("Time cost: "+str(end_time-start_time)+"s")
-        self.logger.info("The result_list is:"+str(result_list))
-        return result_list
+            end_time=time.time()
+            self.logger.info("Time cost: "+str(end_time-start_time)+"s")
+            self.logger.info("The result_list is:"+str(result_list))
+            return result_list
+        except Exception:
+            self.logger.error("Some wrong while dealing the data_list:  "+traceback.format_exc())
+            raise
 
     #  消息解读函数
     def interpretate_message(self, message, message_type, serviceid, worktype, redis_ip="127.0.0.1", redis_port=6379):
@@ -396,7 +402,7 @@ class Service(object):
             # 预留控制字段信息的检查
             return (False, "control type is not support now")
 
-    @retry(stop_max_attempt_number=3, retry_on_result=_retry_on_false, wait_fixed=2000)
+    @retry(stop_max_attempt_number=3, retry_on_result=_retry_on_false, wait_exponential_multiplier=1000)
     def send_finish_message(self, message, info):
         if 'taskid' not in message:
             temp_taskid = None
@@ -436,7 +442,7 @@ class Service(object):
             return False
             raise
 
-    @retry(stop_max_attempt_number=3, retry_on_result=_retry_on_false, wait_fixed=2000)
+    @retry(stop_max_attempt_number=3, retry_on_result=_retry_on_false, wait_exponential_multiplier=1000)
     def send_received_message(self, message):
         if 'taskid' not in message:
             temp_taskid = None
@@ -531,10 +537,12 @@ class Service(object):
             self.logger.info("Errors occored while polling or dealing the message:  "+traceback.format_exc())
             raise
 
-    # 同步服务注册
-    # 如果返回false  重试3次
-    @retry(stop_max_attempt_number=3, retry_on_result=_retry_on_false, wait_fixed=2000)
+    # 同步服务注册                          之前尝试的次数               可设定的参数，调节等待长短  ms
+    # 如果返回false  重试3次 retry时间间隔=2^previous_attempt_number * wait_exponential_multiplier 和 wait_exponential_max 较小值
+    @retry(stop_max_attempt_number=3, retry_on_result=_retry_on_false, wait_exponential_multiplier=1000)
     def resigter_service(self):
+
+        # self.logger.info("time now="+str(time.time()))
         parametas = json.dumps(self.server_register_parameter)
         try:
             # 设置的超时时间为两秒
@@ -573,7 +581,7 @@ class Service(object):
         })
 
     # 添加健康检查
-    def run_sanic(self):
+    def add_health_check(self):
         try:
             if self._health_check != None:
                 self.app.add_route(self._health_check,
@@ -582,38 +590,54 @@ class Service(object):
                 self.logger.warning("using default health check function")
                 self.app.add_route(self.default_health_check,
                                    uri=self.healthcheck_path)
-            # 添加健康检查的路由
-            self.app.run(self.service_ip, self.service_port)
         except Exception:
             self.logger.error(
                 "Error occored during adding healthcheck route of sanic: "+traceback.format_exc())
             raise
 
+
+    
     # 服务运行
     def run(self):
         try:
             if self._handle_input_item == None and self._handle_input_items == None:
                 self.logger.error("No handling function")
                 return
-            # def run_err_call():
-            #     self.logger.info("Errors melt in running sainc")
-            #     self.p.close()
-            #     self.p.join()
-            #     return
-            #开启健康检查及sanic服务
-            self.p = Process(target=self.run_sanic)
-            self.p.start()
 
-            #进程池
-            # self.p=POOL()
-            # self.p.apply_async(func=self.run_sanic,args=(),error_callback=run_err_call)
+            #健康检查注册路由
+            self.add_health_check()
+
+            def run_err_call():
+                self.logger.info("Errors melt in running sainc")
+                #子进程及当前主进程均关闭
+                #子进程和主进程属于同一进程组，获取进程组ID之后，向进程组发送kill信号
+                os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
+
+            #注册run_err_call来处理signal.SIGTREM信号
+            signal.signal(signal.SIGTERM, run_err_call)
+
+            #运行sanic的函数
+            def run_sanic():
+                #单开进程池来运行sanic，单独进程没有error_callback函数
+                # self.logger.info(str(self.service_ip)+str(self.service_port))
+                self.p=POOL()
+                self.p.apply_async(self.app.run(self.service_ip,self.service_port),args=(),error_callback=run_err_call())
+
+            self.process=Process(target=run_sanic)
+            self.process.start()
+            
+            # self.p.close()
+            # self.p.join()
             
             # 注册服务,重试的次数最大为3次，返回true才算成功
-            self.resigter_service()
-            
+            if not self.resigter_service():
+                self.logger.error("Errors occored while registering service")
+                return
+    
             #监听消息
             self.listen_message()
-        except Exception as err:
+
+        except Exception:
             self.logger.error(
                 "Error occored while running the main process:  "+traceback.format_exc())
             raise

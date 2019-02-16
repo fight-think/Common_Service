@@ -48,7 +48,7 @@ def health_check(request):
         "infor": "wwwww"
     })
 
-print("the process is "+str(__name__))
+# print("the process is "+str(__name__))
 
 
 sv.run()
