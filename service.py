@@ -594,9 +594,6 @@ class Service(object):
             self.logger.error(
                 "Error occored during adding healthcheck route of sanic: "+traceback.format_exc())
             raise
-
-
-    
     # 服务运行
     def run(self):
         try:
@@ -625,10 +622,7 @@ class Service(object):
 
             self.process=Process(target=run_sanic)
             self.process.start()
-            
-            # self.p.close()
-            # self.p.join()
-            
+                     
             # 注册服务,重试的次数最大为3次，返回true才算成功
             if not self.resigter_service():
                 self.logger.error("Errors occored while registering service")

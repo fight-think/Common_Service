@@ -29,7 +29,7 @@ def FBNQ(num):
 #调用系统的运行策略  该函数以协程、多线程或者多进程的方式运
 #传入的是单个处理数据
 @sv.handle_input_item(strategy="process")
-def handle_item(single_request_item,config): #
+def handle_item(single_request_item,config): 
     #可以调用其他地方的代码或者API来处理单个输入
     return FBNQ(single_request_item)
 
