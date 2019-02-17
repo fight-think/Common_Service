@@ -19,8 +19,8 @@ import requests
 import time
 import uuid
 import kafka
-from Handle_Message import Handle_Message
-from Micro_Logger import deal_log
+# from Handle_Message import Handle_Message
+# from Micro_Logger import deal_log
 import redis
 import os
 import sys
@@ -28,6 +28,10 @@ import eventlet
 from functools import partial
 import copy
 import copyreg
+
+from Database_Handle import MongoDB_Store
+from Database_Handle import MySql_Store
+import redis
 
 
 #定义全局变量
@@ -101,12 +105,6 @@ class Service(object):
                 }
             }
 
-            #消息处理类所需要的变量
-            self.handle = Handle_Message()
-            self.handle.red = redis.Redis(host=self.redis_ip,port=self.redis_port)
-            self.handle.finished_url=self.return_url
-            self.handle.error_message=""
-
             #定义数据处理的钩子函数
             self._process_deal_func=None
             self._handle_input_item=None
@@ -114,6 +112,9 @@ class Service(object):
             
             #健康检查的钩子函数
             self._health_check = None
+
+            #保持一个redis连接
+            self.redis_handle = redis.Redis(host=self.redis_ip, port=self.redis_port)
 
         except Exception:
             self.logger.info("Errors melt in the process of initing:  "+traceback.format_exc())
@@ -225,97 +226,6 @@ class Service(object):
         except Exception:
             self.logger.error("Some wrong while dealing the data_list:  "+traceback.format_exc())
             raise
-
-    #  消息解读函数
-    def interpretate_message(self, message, message_type, serviceid, worktype, redis_ip="127.0.0.1", redis_port=6379):
-        if message_type == 0:  # to control message handle
-            self.handle.handle_control_message(message)
-            return
-        #获取变量
-        wokerid =self.service_id
-        worker_type =self.service_type
-
-        stage = message['output']['current_stage']
-        index = message['output']['current_index']
-        next_list = message['output']['stages'][stage]['next']
-        store_list = message['output']['stages'][stage]['store']
-        server_list = message['output']['stages'][stage]['microservices']
-        taskid = message["taskid"]
-        childid = message["childid"]
-        input_list = message['data']
-        topic = message['output']["stages"][stage]["microservices"][index]["topic"]
-        config = message['output']["stages"][stage]["microservices"][index]["config"]
-        
-        
-        # self.handle.initialize(serviceid, message, redis_ip, redis_port)
-        output_flag = False  # if output_flag is true, stage finished, need to out put
-        try:
-            if index+1 >= len(server_list):
-                self.logger.info("judge is OK")
-                output_flag = True
-                if not next_list and not store_list:
-                    self.handle.send_finished_message(wokerid, worker_type, 0, 0,
-                                                      taskid, childid, "finished", self.handle.error_message+"both next and store are null")
-                    return
-                message['output']['depth'] = message['output']['depth'] + 1
-        except Exception as e:
-            # print("----------------------------"+str(self.handle.message))
-            self.logger.error("something in message need")
-            self.handle.error_message = self.handle.error_message + ";" + str(e)
-        if message['output']['depth'] >= message['output']['max_depth']:
-            self.handle.send_finished_message(wokerid, worker_type, 0, 0, taskid,
-                                              childid, "finished", self.handle.error_message)
-            return
-        # check config, decide use redis or not
-        framework_config = config.get('framework', None)
-        if framework_config is None:
-            redis_config = True
-        else:
-            redis_config = framework_config.get("redis", True)
-        if redis_config is True:
-            info_list = self.handle.calculate_different_set(
-                set(input_list), topic + "_" + taskid)
-        else:
-            info_list = input_list
-        if len(info_list) <= 0:
-            self.send_finished_message(wokerid, worker_type, len(info_list), 0, taskid,
-                                              childid, "finished", self.handle.error_message)
-            return
-        result_list = self.deal_data_message(
-            info_list, config.get("service", {}))
-        try:
-            # 处于stage的最后一个阶段，需要将数据输出到数据库和next指定的下一个stage的第一个微服务中
-            if output_flag is True:
-                try:
-                    self.handle.store(store_list,info_list, result_list)
-                except Exception as e:
-                    self.l_group_id.error("the db error")
-                    self.handle.error_message=self.handle.error_message+";the db error"
-                finished_flag = True
-                for n in next_list:  # next字段有值
-                    finished_flag = False
-                    self.send_message(message,topic)
-                if finished_flag is True:
-                    self.handle.send_finished_message(wokerid, worker_type, len(info_list), len(result_list),
-                                                      taskid, childid, "finished", self.handle.error_message)
-                else:
-                    self.handle.send_finished_message(wokerid, worker_type, len(info_list), len(result_list),
-                                                      taskid, childid, "running", self.handle.error_message)
-                return
-            # 不是微服务的最后一个阶段，需要将数据放到data中，通过kafka传递给下一个微服务
-            else:
-                message["data"] = result_list
-                message["output"]["current_index"] = message["output"]["current_index"] + 1
-                self.send_message(message, topic)
-                self.handle.send_finished_message(wokerid, worker_type, len(info_list), len(result_list),
-                                                  taskid, childid, "running", self.handle.error_message)
-                return
-        except Exception as e:
-            self.handle.error_message = self.handle.error_message + ":" + str(e)
-            traceback.print_exc()
-
-        self.handle.insert_redis(
-            set(info_list), topic + "_" + taskid)
 
     # 对消息的完整性进行检验
     def message_check(self, message, message_type):
@@ -487,7 +397,7 @@ class Service(object):
             if self.message_check(message, 1)[0]:
                 # 之后这边是调用侯的代码
                 self.interpretate_message(
-                    message, 1, self.service_id, self.service_type)
+                    message, 1)
             else:
                 info = self.message_check(
                     message, 1)[1]
@@ -620,8 +530,8 @@ class Service(object):
                 self.p=POOL()
                 self.p.apply_async(self.app.run(self.service_ip,self.service_port),args=(),error_callback=run_err_call())
 
-            self.process=Process(target=run_sanic)
-            self.process.start()
+            # self.process=Process(target=run_sanic)
+            # self.process.start()
                      
             # 注册服务,重试的次数最大为3次，返回true才算成功
             if not self.resigter_service():
@@ -635,3 +545,244 @@ class Service(object):
             self.logger.error(
                 "Error occored while running the main process:  "+traceback.format_exc())
             raise
+    
+
+    #  消息解读函数
+    def interpretate_message(self, message, message_type):
+        # 每次处理消息，都需要将error_info字典初始化为空
+        self.error_info = {}
+        if message_type == 0:  # to control message handle
+            self.handle_control_message(message)
+            return
+        # 获取变量
+        stage = message['output']['current_stage']
+        index = message['output']['current_index']
+        next_list = message['output']['stages'][stage]['next']
+        store_list = message['output']['stages'][stage]['store']
+        server_list = message['output']['stages'][stage]['microservices']
+        taskid = message["taskid"]
+        childid = message["childid"]
+        input_list = message['data']
+        topic = message['output']["stages"][stage]["microservices"][index]["topic"]
+        config = message['output']["stages"][stage]["microservices"][index]["config"]
+
+        output_flag = False  # if output_flag is true, this stage finished, need to send infomation to API
+        try:
+            # 条件成立，表示当前微服务是当前stage的最后一个阶段，处理完成后需要进行输出
+            # 所以，需要查看next列表和store列表，以确定阶段结束后数据的流向
+            if index + 1 >= len(server_list):
+                output_flag = True
+                # 如果next列表和store列表为空，表示数据没有输出，后续过程无意义，结束任务
+                if not next_list and not store_list:
+                    self.error_info["output_error"] = "the next list and store list are empty. there is no output path"
+                    self.send_finished_message( 0, 0,taskid, childid, "finished",self.error_info)
+                    return
+                message['output']['depth'] = message['output']['depth'] + 1
+        except Exception as e:
+            self.logger.error("something in message need"+traceback.format_exc())
+            self.error_info["message_error"] = "something in message is needed"
+
+        # 进行深度判断，如果当前深度大于最大深度，则结束任务
+        if message['output']['depth'] >= message['output']['max_depth']:
+            self.send_finished_message( 0, 0, taskid, childid, "finished", self.error_info)
+            return
+        self.logger.info("start redis handle")
+        # 通过配置信息，决定是否使用redis．redis存储了该微服务以往执行的历史数据
+        framework_config = config.get('framework', None)
+        # 框架配置为空，默认使用redis;不为空，根据用户的选择决定是否使用redis
+        if framework_config is None:
+            redis_config = True
+        else:
+            redis_config = framework_config.get("redis", True)
+        # redis_config为真，则根据历史数据去重之后的数据作为真正的输入；否则，message的输入作为真的输入　　　　　　　
+        if redis_config:
+            info_list = self.calculate_different_set(set(input_list), topic + "_" + taskid)
+        else:
+            info_list = input_list
+
+        # 如果真输入为空，则该微服务结束,发送结束消息
+        if not info_list:
+            self.send_finished_message( 0, 0, taskid, childid, "finished", self.error_info)
+            return
+        # 进行数据转换
+        info_list = list(map(int, info_list))
+        # info_list=[1,2,3,4,5]
+        # 进行数据计算
+        self.logger.info("calculate data")
+        result_list = self.deal_data_message(info_list, config.get("service", {}))
+
+        # output_flag为真，则表示处于stage的最后一个阶段，
+        # 需要将数据输出到数据库，和next指定的下一个stage的第一个微服务中
+        self.logger.info("output to database")
+        if output_flag:
+            # 存入数据库
+            try:
+                self.store(store_list, info_list, result_list)
+            except Exception as e:
+                self.logger.error("An error occurred while storing data.")
+                self.error_info["store_error"] = "An error occurred while storing data."
+
+            self.logger.info("send finished message")
+            # 根据next列表,将数据放入到下一个微服务的topic中
+            finished_flag = True     # finished_flag为真，不存在着下一个阶段；　finished_flag为假，存在着下一个阶段
+            for n in next_list:  # next字段有值
+                finished_flag = False
+                try:
+                    self.send_message(message, topic)
+                except Exception as e:
+                    self.logger.error("An error occurred while sending message to kafka." +traceback.format_exc())
+                    self.error_info["store_error"] = "An error occurred while storing data."
+            # finished_flag为真,则没有next stage, 任务结束;else,任务继续执行
+            if finished_flag:
+                self.send_finished_message(len(info_list), len(result_list),
+                                                  taskid, childid, "finished", self.error_info)
+            else:
+                self.send_finished_message(len(info_list), len(result_list),
+                                                  taskid, childid, "running", self.error_info)
+
+        # output_flag为假,则表示处于stage的最后一个阶段,需要将数据放到data中，通过kafka传递给下一个微服务
+        else:
+            self.logger.info("output_flag is false")
+            message["data"] = result_list
+            message["output"]["current_index"] = message["output"]["current_index"] + 1
+            try:
+                self.send_message(message, topic)
+            except Exception as e:
+                self.logger.error("An error occurred while sending message to kafka." + traceback.format_exc())
+                self.error_info["store_error"] = "An error occurred while storing data."
+            self.send_finished_message(len(info_list), len(result_list),
+                                              taskid, childid, "running", self.error_info)
+        self.logger.info("add data to history set")
+        self.insert_redis(topic + "_" + taskid)
+
+    #函数功能:对控制消息进行处理
+    def handle_control_message(self,message):
+        print("this is handle_control_message")
+
+    @retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+    def send(self, m):
+        resp = requests.put(self.return_url, params=json.dumps(m), timeout=3)
+        response_dic = resp.json()
+        return response_dic
+
+    # send finshed message and error message to the finished_api
+    def send_finished_message(self, valid_input_length, output_length,
+                              taskid, childid, status, error_info):
+        m = {
+            "type": "finished",
+            "wokerid": self.service_id,
+            "worker_type": self.service_type,
+            "valid_input_length": valid_input_length,
+            "output_length": output_length,
+            "taskid": taskid,
+            "childid": childid,
+            "status": status,
+            "error_msg": error_info
+        }
+        self.logger.info(m)
+        try:
+            response_dic = self.send(m)
+        except Exception as e:
+            err = "Error 111: the Api which received finished message can not reached"
+            self.logger.error(err + traceback.format_exc())
+            return
+        # get response text. 0:success, -2:para is wrong
+        self.logger.info(response_dic)
+        if not response_dic.get("state", -2) == 0:
+            info = "Error: exception occur in send_finished_message function. the url or json data is wrong"
+            self.logger.error(info)
+        else:
+            self.logger.info("send finished message success")
+
+    # 函数功能: 计算输入数据和历史数据的差集，并将差集返回
+    # 通过retry装饰器,来控制３次重连
+    # ３次重连失败，会跑出链接redis失败的信息,并将异常返回到上一级
+    @retry(stop_max_attempt_number=4, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+    def get_sub(self, set_name, info_set):
+        try:
+            self.redis_handle.delete("set_help")     # 清空辅助redis.set集合
+
+            # 使用redis的pipeline技术,批量上传数据
+            pipe = self.redis_handle.pipeline(transaction=False)
+            # ་将数据存放到set_help,使用pipeline
+            for value in info_set:
+                pipe.sadd("set_help", value)
+            pipe.execute()
+
+            # 将set_help和历史记录做差
+            self.redis_handle.sdiffstore("set_help", "set_help", set_name)
+            sub = self.redis_handle.sinter("set_help")
+            # 返回set_help中的数据
+            return sub
+        except Exception as e:
+            # 重连redis
+            self.redis_handle = redis.Redis(host=self.redis_ip, port=self.redis_port, decode_responses=True)
+            pipe = self.redis_handle.pipeline(transaction=False)
+            raise
+
+    # 函数功能：将输入数据和历史数据作差集
+    # 输入：set1:输入集合，set_name:集合名字，redis_?：链接信息
+    # 输出：与历史记录的差集
+    def calculate_different_set(self, set1, set_name):
+        r_list = list()
+
+        # 计算差集；　如果出现异常, redis数据库连接失败,输出错误信息, 将输入数据作为真实数据输出
+        try:
+            r_list = list(self.get_sub( set_name, set1))
+        except Exception as e:
+            r_list = list(set1)
+            self.logger.error("Connection to the redis refused in calculate_different_set")
+            self.error_info["redis_error1"] = str(e)
+        finally:
+            return r_list
+
+    # 函数功能:　将真实数据插入到历史数据集合中
+    @retry(stop_max_attempt_number = 3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+    def add_info_list( self, set_name ):
+        # 将set1中的数据添加到历史数据的set集合中
+        try:
+            self.redis_handle.sunion(set_name, set_name, "set_help")
+        except Exception as e:
+            self.redis_handle = redis.Redis(host=self.redis_ip, port=self.redis_port, decode_responses=True)
+            raise
+
+    # 函数功能：将数据插入到redis中
+    # 输入：set1:输入集合，set_name:集合名字，redis_?：链接信息
+    # 输出：将数据插入到redis.set()中
+    def insert_redis(self, set_name):
+        try:
+            self.add_info_list(set_name)
+        except Exception as e:
+            self.logger.error("Connection to the redis refused in insert_redis function")
+            self.error_info["redis_error1"] = str(e)
+
+    # 函数功能: 按照store list, 进行数据存储
+    def store(self, store_list, data_list, result_list):
+        if not store_list:
+            return
+        for s_way in store_list:
+            # self.logger.info("I am here")
+            if s_way["type"] == "mongoDB":
+                url = s_way["url"]
+                db_name = s_way["database"]
+                col_name = s_way["collection"]
+                mongodb = MongoDB_Store()
+                try:
+                    mongodb.store_data_list(url, db_name, col_name, data_list, result_list)
+                except Exception as e:
+                    error_msg = "store data by mongodb is wrong in store function"
+                    self.logger.error(error_msg + traceback.format_exc())
+                    self.error_info["strore"] = error_msg
+
+            elif s_way["type"] == "mysql":
+                i = 0
+                while i < len(data_list):
+                    sql = "insert into table(key,vlaue) values('{key}','{value}')".format(key=str(data_list[i]),
+                                                                                          value=str(result_list[i]))
+                    MySql_Store().insert(sql)
+                    i = i + 1
+                pass
+            elif s_way["type"] == "file":
+                pass
+            else:
+                pass
